@@ -48,6 +48,31 @@ func voiceSID(name string) int {
 	return 0 // default to af
 }
 
+func voiceLang(name string) string {
+	if len(name) < 1 {
+		return "en"
+	}
+	switch name[0] {
+	case 'a', 'b':
+		return "en"
+	case 'j':
+		return "ja"
+	case 'z':
+		return "zh"
+	case 'e':
+		return "es"
+	case 'f':
+		return "fr"
+	case 'h':
+		return "hi"
+	case 'i':
+		return "it"
+	case 'p':
+		return "pt-br"
+	}
+	return "en"
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 func main() {
@@ -157,11 +182,18 @@ func synthesize(text, voiceName string, speed float64) ([]byte, error) {
 	bin := filepath.Join(dataDir, "sherpa-onnx", sherpaBinaryName())
 	sid := voiceSID(voiceName)
 
+	lexicons := filepath.Join(modelDir, "lexicon-us-en.txt") + "," +
+		filepath.Join(modelDir, "lexicon-gb-en.txt") + "," +
+		filepath.Join(modelDir, "lexicon-zh.txt")
+
 	cmd := exec.Command(bin,
 		"--kokoro-model="+filepath.Join(modelDir, "model.onnx"),
 		"--kokoro-voices="+filepath.Join(modelDir, "voices.bin"),
 		"--kokoro-tokens="+filepath.Join(modelDir, "tokens.txt"),
 		"--kokoro-data-dir="+filepath.Join(modelDir, "espeak-ng-data"),
+		"--kokoro-dict-dir="+filepath.Join(modelDir, "dict"),
+		"--kokoro-lexicon="+lexicons,
+		"--kokoro-lang="+voiceLang(voiceName),
 		fmt.Sprintf("--sid=%d", sid),
 		fmt.Sprintf("--kokoro-length-scale=%.2f", 1.0/speed),
 		"--output-filename="+tmpFile.Name(),
