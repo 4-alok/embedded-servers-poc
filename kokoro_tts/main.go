@@ -1,8 +1,8 @@
 package main
 
 import (
-	"compress/bzip2"
 	"archive/tar"
+	"compress/bzip2"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,12 +19,34 @@ import (
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const (
-	sherpaVersion = "1.12.28"
-	sherpaBaseURL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v" + sherpaVersion
-	kokoroModelURL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-en-v0_19.tar.bz2"
+	sherpaVersion  = "1.12.28"
+	sherpaBaseURL  = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v" + sherpaVersion
+	kokoroModelURL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_1.tar.bz2"
 )
 
 var dataDir string
+
+// ── Kokoro voice catalogue ────────────────────────────────────────────────────
+// The kokoro-en-v0_19 model ships with these style embeddings in voices.bin.
+// Speaker ID (--sid) selects the style; names match the original Kokoro paper.
+
+type voiceEntry struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
+	ID          string `json:"id"`
+	SID         int    `json:"-"` // passed as --sid to sherpa-onnx
+}
+
+// kokoroVoices list is auto-generated in voices.go
+
+func voiceSID(name string) int {
+	for _, v := range kokoroVoices {
+		if v.Name == name {
+			return v.SID
+		}
+	}
+	return 0 // default to af
+}
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -48,7 +70,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
-	mux.HandleFunc("POST /tts", handleTTS)
+	mux.HandleFunc("GET /v1/audio/voices", handleVoices)
+	mux.HandleFunc("GET /v1/audio/voices/catalog", handleVoicesCatalog)
+	mux.HandleFunc("POST /v1/audio/speech", handleSpeech)
 
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)
 	log.Printf("Kokoro TTS server listening on http://%s", addr)
@@ -61,22 +85,53 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "ok", "engine": "kokoro"})
 }
 
-func handleTTS(w http.ResponseWriter, r *http.Request) {
+// GET /v1/audio/voices — returns the catalogue of Kokoro style voices.
+func handleVoices(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, kokoroVoices)
+}
+
+type catalogEntry struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
+	ID          string `json:"id"`
+	Downloaded  bool   `json:"downloaded"`
+}
+
+// GET /v1/audio/voices/catalog — all Kokoro voices ship with the single model,
+// so every voice is always downloaded once the server starts.
+func handleVoicesCatalog(w http.ResponseWriter, r *http.Request) {
+	catalog := make([]catalogEntry, len(kokoroVoices))
+	for i, v := range kokoroVoices {
+		catalog[i] = catalogEntry{
+			Name:        v.Name,
+			DisplayName: v.DisplayName,
+			ID:          v.ID,
+			Downloaded:  true,
+		}
+	}
+	writeJSON(w, catalog)
+}
+
+// POST /v1/audio/speech — OpenAI-compatible synthesis endpoint.
+// Request:  {"input": "...", "voice": "af_sky", "speed": 1.0}
+// Response: audio/wav bytes
+func handleSpeech(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Text  string  `json:"text"`
-		Speed float64 `json:"speed"` // optional, default 1.0
+		Input string  `json:"input"`
+		Voice string  `json:"voice"`
+		Speed float64 `json:"speed"`
 	}
 	req.Speed = 1.0
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if strings.TrimSpace(req.Text) == "" {
-		http.Error(w, "text is required", http.StatusBadRequest)
+	if strings.TrimSpace(req.Input) == "" {
+		http.Error(w, "input is required", http.StatusBadRequest)
 		return
 	}
 
-	wavBytes, err := synthesize(req.Text, req.Speed)
+	wavBytes, err := synthesize(req.Input, req.Voice, req.Speed)
 	if err != nil {
 		log.Printf("synthesis error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -89,8 +144,8 @@ func handleTTS(w http.ResponseWriter, r *http.Request) {
 
 // ── Synthesis ─────────────────────────────────────────────────────────────────
 
-func synthesize(text string, speed float64) ([]byte, error) {
-	modelDir := filepath.Join(dataDir, "kokoro-en-v0_19")
+func synthesize(text, voiceName string, speed float64) ([]byte, error) {
+	modelDir := filepath.Join(dataDir, "kokoro-multi-lang-v1_1")
 
 	tmpFile, err := os.CreateTemp("", "kokoro-*.wav")
 	if err != nil {
@@ -100,13 +155,15 @@ func synthesize(text string, speed float64) ([]byte, error) {
 	defer os.Remove(tmpFile.Name())
 
 	bin := filepath.Join(dataDir, "sherpa-onnx", sherpaBinaryName())
+	sid := voiceSID(voiceName)
 
 	cmd := exec.Command(bin,
 		"--kokoro-model="+filepath.Join(modelDir, "model.onnx"),
 		"--kokoro-voices="+filepath.Join(modelDir, "voices.bin"),
 		"--kokoro-tokens="+filepath.Join(modelDir, "tokens.txt"),
 		"--kokoro-data-dir="+filepath.Join(modelDir, "espeak-ng-data"),
-		fmt.Sprintf("--length-scale=%.2f", 1.0/speed),
+		fmt.Sprintf("--sid=%d", sid),
+		fmt.Sprintf("--kokoro-length-scale=%.2f", 1.0/speed),
 		"--output-filename="+tmpFile.Name(),
 		text,
 	)
@@ -149,7 +206,6 @@ func ensureSherpaOnnx() error {
 		return fmt.Errorf("extract: %w", err)
 	}
 
-	// The archive has a versioned subdirectory — find and move bin/ and lib files
 	entries, _ := os.ReadDir(destDir)
 	if len(entries) == 0 {
 		return fmt.Errorf("extraction produced no files")
@@ -159,10 +215,8 @@ func ensureSherpaOnnx() error {
 	target := filepath.Join(dataDir, "sherpa-onnx")
 	os.MkdirAll(target, 0755)
 
-	// Copy the TTS binary
 	srcBin := filepath.Join(topDir, "bin", sherpaBinaryName())
 	if err := copyFile(srcBin, bin); err != nil {
-		// try bin/ without subdir
 		srcBin = filepath.Join(topDir, sherpaBinaryName())
 		if err2 := copyFile(srcBin, bin); err2 != nil {
 			return fmt.Errorf("copy binary: %v / %v", err, err2)
@@ -170,7 +224,6 @@ func ensureSherpaOnnx() error {
 	}
 	os.Chmod(bin, 0755)
 
-	// Copy shared libraries
 	for _, ext := range []string{".dylib", ".so"} {
 		copyGlob(filepath.Join(topDir, "lib"), target, "*"+ext)
 		copyGlob(topDir, target, "*"+ext)
@@ -183,13 +236,13 @@ func ensureSherpaOnnx() error {
 }
 
 func ensureKokoroModel() error {
-	modelDir := filepath.Join(dataDir, "kokoro-en-v0_19")
+	modelDir := filepath.Join(dataDir, "kokoro-multi-lang-v1_1")
 	if fileExists(filepath.Join(modelDir, "model.onnx")) {
 		log.Printf("Kokoro model already present.")
 		return nil
 	}
 
-	archivePath := filepath.Join(dataDir, "kokoro-en-v0_19.tar.bz2")
+	archivePath := filepath.Join(dataDir, "kokoro-multi-lang-v1_1.tar.bz2")
 	log.Printf("Downloading Kokoro model from %s ...", kokoroModelURL)
 	if err := downloadFile(kokoroModelURL, archivePath); err != nil {
 		return fmt.Errorf("download kokoro model: %w", err)
