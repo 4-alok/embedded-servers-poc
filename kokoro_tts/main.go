@@ -3,32 +3,39 @@ package main
 import (
 	"archive/tar"
 	"compress/bzip2"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+
+	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const (
-	sherpaVersion  = "1.12.28"
-	sherpaBaseURL  = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v" + sherpaVersion
 	kokoroModelURL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_1.tar.bz2"
 )
 
 var dataDir string
 
+// ── Persistent TTS engine ─────────────────────────────────────────────────────
+
+var (
+	ttsEngine *sherpa.OfflineTts
+	ttsMu     sync.Mutex // guards ttsEngine during synthesis
+)
+
 // ── Kokoro voice catalogue ────────────────────────────────────────────────────
-// The kokoro-en-v0_19 model ships with these style embeddings in voices.bin.
-// Speaker ID (--sid) selects the style; names match the original Kokoro paper.
 
 type voiceEntry struct {
 	Name        string `json:"name"`
@@ -77,6 +84,7 @@ func voiceLang(name string) string {
 
 func main() {
 	port := flag.Int("port", 8082, "Port to listen on")
+	numThreads := flag.Int("threads", runtime.NumCPU(), "Number of threads for ONNX inference")
 	flag.Parse()
 
 	var err error
@@ -86,12 +94,36 @@ func main() {
 	}
 	log.Printf("Data directory: %s", dataDir)
 
-	if err := ensureSherpaOnnx(); err != nil {
-		log.Fatalf("sherpa-onnx setup failed: %v", err)
-	}
 	if err := ensureKokoroModel(); err != nil {
 		log.Fatalf("Kokoro model setup failed: %v", err)
 	}
+
+	// ── Load TTS model once into memory ──────────────────────────────────
+	modelDir := filepath.Join(dataDir, "kokoro-multi-lang-v1_1")
+
+	lexicons := filepath.Join(modelDir, "lexicon-us-en.txt") + "," +
+		filepath.Join(modelDir, "lexicon-gb-en.txt") + "," +
+		filepath.Join(modelDir, "lexicon-zh.txt")
+
+	config := sherpa.OfflineTtsConfig{}
+	config.Model.Kokoro.Model = filepath.Join(modelDir, "model.onnx")
+	config.Model.Kokoro.Voices = filepath.Join(modelDir, "voices.bin")
+	config.Model.Kokoro.Tokens = filepath.Join(modelDir, "tokens.txt")
+	config.Model.Kokoro.DataDir = filepath.Join(modelDir, "espeak-ng-data")
+	config.Model.Kokoro.Lexicon = lexicons
+	config.Model.Kokoro.LengthScale = 1.0
+	config.Model.NumThreads = *numThreads
+	config.Model.Debug = 0
+	config.Model.Provider = "cpu"
+	config.MaxNumSentences = 1
+
+	log.Printf("Loading Kokoro model (threads=%d)...", *numThreads)
+	ttsEngine = sherpa.NewOfflineTts(&config)
+	if ttsEngine == nil {
+		log.Fatalf("Failed to create TTS engine — check model paths")
+	}
+	defer sherpa.DeleteOfflineTts(ttsEngine)
+	log.Println("Kokoro model loaded and ready!")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
@@ -167,105 +199,65 @@ func handleSpeech(w http.ResponseWriter, r *http.Request) {
 	w.Write(wavBytes)
 }
 
-// ── Synthesis ─────────────────────────────────────────────────────────────────
+// ── Synthesis (in-process) ───────────────────────────────────────────────────
 
 func synthesize(text, voiceName string, speed float64) ([]byte, error) {
-	modelDir := filepath.Join(dataDir, "kokoro-multi-lang-v1_1")
-
-	tmpFile, err := os.CreateTemp("", "kokoro-*.wav")
-	if err != nil {
-		return nil, err
-	}
-	tmpFile.Close()
-	defer os.Remove(tmpFile.Name())
-
-	bin := filepath.Join(dataDir, "sherpa-onnx", sherpaBinaryName())
 	sid := voiceSID(voiceName)
+	speedF32 := float32(math.Max(speed, 1e-6))
 
-	lexicons := filepath.Join(modelDir, "lexicon-us-en.txt") + "," +
-		filepath.Join(modelDir, "lexicon-gb-en.txt") + "," +
-		filepath.Join(modelDir, "lexicon-zh.txt")
+	ttsMu.Lock()
+	audio := ttsEngine.Generate(text, sid, speedF32)
+	ttsMu.Unlock()
 
-	cmd := exec.Command(bin,
-		"--kokoro-model="+filepath.Join(modelDir, "model.onnx"),
-		"--kokoro-voices="+filepath.Join(modelDir, "voices.bin"),
-		"--kokoro-tokens="+filepath.Join(modelDir, "tokens.txt"),
-		"--kokoro-data-dir="+filepath.Join(modelDir, "espeak-ng-data"),
-		"--kokoro-dict-dir="+filepath.Join(modelDir, "dict"),
-		"--kokoro-lexicon="+lexicons,
-		"--kokoro-lang="+voiceLang(voiceName),
-		fmt.Sprintf("--sid=%d", sid),
-		fmt.Sprintf("--kokoro-length-scale=%.2f", 1.0/speed),
-		"--output-filename="+tmpFile.Name(),
-		text,
-	)
-	cmd.Dir = filepath.Join(dataDir, "sherpa-onnx")
-	cmd.Env = append(os.Environ(),
-		"DYLD_LIBRARY_PATH="+filepath.Join(dataDir, "sherpa-onnx"),
-		"LD_LIBRARY_PATH="+filepath.Join(dataDir, "sherpa-onnx"),
-	)
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("sherpa-onnx error: %v\n%s", err, out)
+	if audio == nil || len(audio.Samples) == 0 {
+		return nil, fmt.Errorf("synthesis returned empty audio")
 	}
 
-	return os.ReadFile(tmpFile.Name())
+	return samplesToWAV(audio.Samples, audio.SampleRate), nil
+}
+
+// samplesToWAV encodes float32 PCM samples into a WAV file (16-bit PCM) in memory.
+func samplesToWAV(samples []float32, sampleRate int) []byte {
+	numSamples := len(samples)
+	dataSize := numSamples * 2 // 16-bit = 2 bytes per sample
+	fileSize := 44 + dataSize  // 44-byte WAV header
+
+	buf := make([]byte, fileSize)
+
+	// RIFF header
+	copy(buf[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(fileSize-8))
+	copy(buf[8:12], "WAVE")
+
+	// fmt sub-chunk
+	copy(buf[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(buf[16:20], 16) // PCM chunk size
+	binary.LittleEndian.PutUint16(buf[20:22], 1)  // PCM format
+	binary.LittleEndian.PutUint16(buf[22:24], 1)  // mono
+	binary.LittleEndian.PutUint32(buf[24:28], uint32(sampleRate))
+	binary.LittleEndian.PutUint32(buf[28:32], uint32(sampleRate*2)) // byte rate
+	binary.LittleEndian.PutUint16(buf[32:34], 2)                   // block align
+	binary.LittleEndian.PutUint16(buf[34:36], 16)                  // bits per sample
+
+	// data sub-chunk
+	copy(buf[36:40], "data")
+	binary.LittleEndian.PutUint32(buf[40:44], uint32(dataSize))
+
+	// Convert float32 [-1,1] → int16
+	for i, s := range samples {
+		if s > 1.0 {
+			s = 1.0
+		} else if s < -1.0 {
+			s = -1.0
+		}
+		val := int16(s * 32767)
+		binary.LittleEndian.PutUint16(buf[44+i*2:44+i*2+2], uint16(val))
+	}
+
+	return buf
 }
 
 // ── Download helpers ──────────────────────────────────────────────────────────
-
-func ensureSherpaOnnx() error {
-	bin := filepath.Join(dataDir, "sherpa-onnx", sherpaBinaryName())
-	if fileExists(bin) {
-		log.Printf("sherpa-onnx binary already present.")
-		return nil
-	}
-
-	archiveName := sherpaArchiveName()
-	url := sherpaBaseURL + "/" + archiveName
-	archivePath := filepath.Join(dataDir, archiveName)
-
-	log.Printf("Downloading sherpa-onnx from %s ...", url)
-	if err := downloadFile(url, archivePath); err != nil {
-		return fmt.Errorf("download sherpa-onnx: %w", err)
-	}
-	defer os.Remove(archivePath)
-
-	log.Printf("Extracting sherpa-onnx...")
-	destDir := filepath.Join(dataDir, "sherpa-onnx-extract")
-	if err := extractTarBz2(archivePath, destDir); err != nil {
-		return fmt.Errorf("extract: %w", err)
-	}
-
-	entries, _ := os.ReadDir(destDir)
-	if len(entries) == 0 {
-		return fmt.Errorf("extraction produced no files")
-	}
-	topDir := filepath.Join(destDir, entries[0].Name())
-
-	target := filepath.Join(dataDir, "sherpa-onnx")
-	os.MkdirAll(target, 0755)
-
-	srcBin := filepath.Join(topDir, "bin", sherpaBinaryName())
-	if err := copyFile(srcBin, bin); err != nil {
-		srcBin = filepath.Join(topDir, sherpaBinaryName())
-		if err2 := copyFile(srcBin, bin); err2 != nil {
-			return fmt.Errorf("copy binary: %v / %v", err, err2)
-		}
-	}
-	os.Chmod(bin, 0755)
-
-	for _, ext := range []string{".dylib", ".so"} {
-		copyGlob(filepath.Join(topDir, "lib"), target, "*"+ext)
-		copyGlob(topDir, target, "*"+ext)
-	}
-	copyGlob(filepath.Join(topDir, "bin"), target, "*.dll")
-
-	os.RemoveAll(destDir)
-	log.Printf("sherpa-onnx ready.")
-	return nil
-}
 
 func ensureKokoroModel() error {
 	modelDir := filepath.Join(dataDir, "kokoro-multi-lang-v1_1")
@@ -344,48 +336,7 @@ func downloadFile(url, dst string) error {
 	return err
 }
 
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
-}
-
-func copyGlob(srcDir, dstDir, pattern string) {
-	matches, _ := filepath.Glob(filepath.Join(srcDir, pattern))
-	for _, m := range matches {
-		dst := filepath.Join(dstDir, filepath.Base(m))
-		copyFile(m, dst)
-	}
-}
-
 // ── Platform helpers ──────────────────────────────────────────────────────────
-
-func sherpaArchiveName() string {
-	switch runtime.GOOS {
-	case "darwin":
-		return fmt.Sprintf("sherpa-onnx-v%s-osx-universal2-shared.tar.bz2", sherpaVersion)
-	case "windows":
-		return fmt.Sprintf("sherpa-onnx-v%s-win-x64-shared-MD-Release.tar.bz2", sherpaVersion)
-	default:
-		return fmt.Sprintf("sherpa-onnx-v%s-linux-x86_64-shared.tar.bz2", sherpaVersion)
-	}
-}
-
-func sherpaBinaryName() string {
-	if runtime.GOOS == "windows" {
-		return "sherpa-onnx-offline-tts.exe"
-	}
-	return "sherpa-onnx-offline-tts"
-}
 
 func resolveDataDir() (string, error) {
 	home, err := os.UserHomeDir()

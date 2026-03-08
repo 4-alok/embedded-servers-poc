@@ -3,30 +3,93 @@ package main
 import (
 	"archive/tar"
 	"compress/bzip2"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+
+	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
 
 // ── Config ────────────────────────────────────────────────────────────────────
-// Uses sherpa-onnx binary (bundles all dylibs — no system dependency) to run
-// VITS/piper voice models downloaded from the sherpa-onnx tts-models release.
 
 const (
-	sherpaVersion  = "1.12.28"
-	sherpaBaseURL  = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v" + sherpaVersion
 	piperModelsURL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models"
 )
 
 var dataDir string
+
+// ── Persistent TTS engine with voice hot-swap ─────────────────────────────────
+
+type ttsState struct {
+	mu        sync.RWMutex
+	engine    *sherpa.OfflineTts
+	voiceName string // currently loaded voice
+}
+
+var tts = &ttsState{}
+
+// getOrSwap returns the current TTS engine if it matches the requested voice,
+// otherwise tears down the old model and loads the new one.
+func (t *ttsState) getOrSwap(v *voiceEntry, numThreads int) (*sherpa.OfflineTts, error) {
+	// Fast path: read lock to check if the voice is already loaded.
+	t.mu.RLock()
+	if t.engine != nil && t.voiceName == v.Name {
+		engine := t.engine
+		t.mu.RUnlock()
+		return engine, nil
+	}
+	t.mu.RUnlock()
+
+	// Slow path: write lock to swap the model.
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Double-check after acquiring write lock.
+	if t.engine != nil && t.voiceName == v.Name {
+		return t.engine, nil
+	}
+
+	// Tear down old engine.
+	if t.engine != nil {
+		log.Printf("Unloading voice %q", t.voiceName)
+		sherpa.DeleteOfflineTts(t.engine)
+		t.engine = nil
+		t.voiceName = ""
+	}
+
+	// Create new engine for the requested voice.
+	dir := modelDir(v)
+	config := sherpa.OfflineTtsConfig{}
+	config.Model.Vits.Model = filepath.Join(dir, v.modelFile)
+	config.Model.Vits.DataDir = filepath.Join(dir, "espeak-ng-data")
+	config.Model.Vits.Tokens = filepath.Join(dir, "tokens.txt")
+	config.Model.Vits.LengthScale = 1.0
+	config.Model.NumThreads = numThreads
+	config.Model.Debug = 0
+	config.Model.Provider = "cpu"
+	config.MaxNumSentences = 1
+
+	log.Printf("Loading voice %q ...", v.Name)
+	engine := sherpa.NewOfflineTts(&config)
+	if engine == nil {
+		return nil, fmt.Errorf("failed to load voice %q — check model files in %s", v.Name, dir)
+	}
+
+	t.engine = engine
+	t.voiceName = v.Name
+	log.Printf("Voice %q loaded and ready!", v.Name)
+	return engine, nil
+}
 
 // ── Voice catalogue ───────────────────────────────────────────────────────────
 
@@ -50,15 +113,19 @@ func findVoice(name string) *voiceEntry {
 }
 
 func modelDir(v *voiceEntry) string {
-	// archive "vits-piper-en_US-amy-low.tar.bz2" → dir "vits-piper-en_US-amy-low"
 	return filepath.Join(dataDir, strings.TrimSuffix(v.archive, ".tar.bz2"))
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+var numThreadsGlobal int
+
 func main() {
 	port := flag.Int("port", 8081, "Port to listen on")
+	numThreads := flag.Int("threads", runtime.NumCPU(), "Number of threads for ONNX inference")
 	flag.Parse()
+
+	numThreadsGlobal = *numThreads
 
 	var err error
 	dataDir, err = resolveDataDir()
@@ -67,12 +134,14 @@ func main() {
 	}
 	log.Printf("Data directory: %s", dataDir)
 
-	if err := ensureSherpaOnnx(); err != nil {
-		log.Fatalf("sherpa-onnx setup failed: %v", err)
-	}
 	// Download the default voice on first run so the server is immediately usable.
 	if err := ensureVoice(&voices[0]); err != nil {
 		log.Fatalf("default voice setup failed: %v", err)
+	}
+
+	// Pre-load the default voice into memory.
+	if _, err := tts.getOrSwap(&voices[0], numThreadsGlobal); err != nil {
+		log.Fatalf("failed to load default voice: %v", err)
 	}
 
 	mux := http.NewServeMux()
@@ -129,8 +198,6 @@ func handleVoicesCatalog(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /v1/audio/voices/download — downloads a voice model synchronously.
-// Request:  {"voice": "en_US-libritts-high"}
-// Response: {"status": "ok", "voice": "en_US-libritts-high"}
 func handleVoiceDownload(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Voice string `json:"voice"`
@@ -158,8 +225,6 @@ func handleVoiceDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /v1/audio/speech — OpenAI-compatible synthesis.
-// Request:  {"input": "...", "voice": "en_US-amy-low", "speed": 1.0}
-// Response: audio/wav bytes
 func handleSpeech(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Input string  `json:"input"`
@@ -198,97 +263,69 @@ func handleSpeech(w http.ResponseWriter, r *http.Request) {
 	w.Write(wavBytes)
 }
 
-// ── Synthesis ─────────────────────────────────────────────────────────────────
+// ── Synthesis (in-process with voice hot-swap) ───────────────────────────────
 
 func synthesize(text string, v *voiceEntry, speed float64) ([]byte, error) {
-	dir := modelDir(v)
-
-	tmpFile, err := os.CreateTemp("", "piper-*.wav")
+	engine, err := tts.getOrSwap(v, numThreadsGlobal)
 	if err != nil {
 		return nil, err
 	}
-	tmpFile.Close()
-	defer os.Remove(tmpFile.Name())
 
-	bin := filepath.Join(dataDir, "sherpa-onnx", sherpaBinaryName())
-	sherpaDir := filepath.Join(dataDir, "sherpa-onnx")
+	speedF32 := float32(math.Max(speed, 1e-6))
 
-	args := []string{
-		"--vits-model=" + filepath.Join(dir, v.modelFile),
-		"--vits-data-dir=" + filepath.Join(dir, "espeak-ng-data"),
-		"--vits-tokens=" + filepath.Join(dir, "tokens.txt"),
-		fmt.Sprintf("--vits-length-scale=%.2f", 1.0/speed), // VITS uses --vits-length-scale, not --length-scale
-		"--output-filename=" + tmpFile.Name(),
-		text,
+	// Acquire read lock during synthesis to prevent model swap mid-inference.
+	tts.mu.RLock()
+	audio := engine.Generate(text, 0, speedF32)
+	tts.mu.RUnlock()
+
+	if audio == nil || len(audio.Samples) == 0 {
+		return nil, fmt.Errorf("synthesis returned empty audio")
 	}
 
-	cmd := exec.Command(bin, args...)
-	cmd.Dir = sherpaDir
-	cmd.Env = append(os.Environ(),
-		"DYLD_LIBRARY_PATH="+sherpaDir,
-		"LD_LIBRARY_PATH="+sherpaDir,
-	)
+	return samplesToWAV(audio.Samples, audio.SampleRate), nil
+}
 
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("sherpa-onnx error: %v\n%s", err, out)
+// samplesToWAV encodes float32 PCM samples into a WAV file (16-bit PCM) in memory.
+func samplesToWAV(samples []float32, sampleRate int) []byte {
+	numSamples := len(samples)
+	dataSize := numSamples * 2
+	fileSize := 44 + dataSize
+
+	buf := make([]byte, fileSize)
+
+	// RIFF header
+	copy(buf[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(fileSize-8))
+	copy(buf[8:12], "WAVE")
+
+	// fmt sub-chunk
+	copy(buf[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(buf[16:20], 16)
+	binary.LittleEndian.PutUint16(buf[20:22], 1) // PCM
+	binary.LittleEndian.PutUint16(buf[22:24], 1) // mono
+	binary.LittleEndian.PutUint32(buf[24:28], uint32(sampleRate))
+	binary.LittleEndian.PutUint32(buf[28:32], uint32(sampleRate*2))
+	binary.LittleEndian.PutUint16(buf[32:34], 2)
+	binary.LittleEndian.PutUint16(buf[34:36], 16)
+
+	// data sub-chunk
+	copy(buf[36:40], "data")
+	binary.LittleEndian.PutUint32(buf[40:44], uint32(dataSize))
+
+	for i, s := range samples {
+		if s > 1.0 {
+			s = 1.0
+		} else if s < -1.0 {
+			s = -1.0
+		}
+		val := int16(s * 32767)
+		binary.LittleEndian.PutUint16(buf[44+i*2:44+i*2+2], uint16(val))
 	}
 
-	return os.ReadFile(tmpFile.Name())
+	return buf
 }
 
 // ── Download helpers ──────────────────────────────────────────────────────────
-
-func ensureSherpaOnnx() error {
-	bin := filepath.Join(dataDir, "sherpa-onnx", sherpaBinaryName())
-	if fileExists(bin) {
-		log.Printf("sherpa-onnx binary already present.")
-		return nil
-	}
-
-	archiveName := sherpaArchiveName()
-	url := sherpaBaseURL + "/" + archiveName
-	archivePath := filepath.Join(dataDir, archiveName)
-
-	log.Printf("Downloading sherpa-onnx from %s ...", url)
-	if err := downloadFile(url, archivePath); err != nil {
-		return fmt.Errorf("download sherpa-onnx: %w", err)
-	}
-	defer os.Remove(archivePath)
-
-	log.Printf("Extracting sherpa-onnx...")
-	destDir := filepath.Join(dataDir, "sherpa-onnx-extract")
-	if err := extractTarBz2(archivePath, destDir); err != nil {
-		return fmt.Errorf("extract: %w", err)
-	}
-
-	entries, _ := os.ReadDir(destDir)
-	if len(entries) == 0 {
-		return fmt.Errorf("extraction produced no files")
-	}
-	topDir := filepath.Join(destDir, entries[0].Name())
-	target := filepath.Join(dataDir, "sherpa-onnx")
-	os.MkdirAll(target, 0755)
-
-	srcBin := filepath.Join(topDir, "bin", sherpaBinaryName())
-	if err := copyFile(srcBin, bin); err != nil {
-		srcBin = filepath.Join(topDir, sherpaBinaryName())
-		if err2 := copyFile(srcBin, bin); err2 != nil {
-			return fmt.Errorf("copy binary: %v / %v", err, err2)
-		}
-	}
-	os.Chmod(bin, 0755)
-
-	for _, ext := range []string{".dylib", ".so"} {
-		copyGlob(filepath.Join(topDir, "lib"), target, "*"+ext)
-		copyGlob(topDir, target, "*"+ext)
-	}
-	copyGlob(filepath.Join(topDir, "bin"), target, "*.dll")
-
-	os.RemoveAll(destDir)
-	log.Printf("sherpa-onnx ready.")
-	return nil
-}
 
 func ensureVoice(v *voiceEntry) error {
 	dir := modelDir(v)
@@ -368,47 +405,7 @@ func downloadFile(url, dst string) error {
 	return err
 }
 
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
-}
-
-func copyGlob(srcDir, dstDir, pattern string) {
-	matches, _ := filepath.Glob(filepath.Join(srcDir, pattern))
-	for _, m := range matches {
-		copyFile(m, filepath.Join(dstDir, filepath.Base(m)))
-	}
-}
-
 // ── Platform helpers ──────────────────────────────────────────────────────────
-
-func sherpaArchiveName() string {
-	switch runtime.GOOS {
-	case "darwin":
-		return fmt.Sprintf("sherpa-onnx-v%s-osx-universal2-shared.tar.bz2", sherpaVersion)
-	case "windows":
-		return fmt.Sprintf("sherpa-onnx-v%s-win-x64-shared-MD-Release.tar.bz2", sherpaVersion)
-	default:
-		return fmt.Sprintf("sherpa-onnx-v%s-linux-x86_64-shared.tar.bz2", sherpaVersion)
-	}
-}
-
-func sherpaBinaryName() string {
-	if runtime.GOOS == "windows" {
-		return "sherpa-onnx-offline-tts.exe"
-	}
-	return "sherpa-onnx-offline-tts"
-}
 
 func resolveDataDir() (string, error) {
 	home, err := os.UserHomeDir()
