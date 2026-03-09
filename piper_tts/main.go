@@ -20,6 +20,10 @@ import (
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
 
+// modelReadyCh is closed once the default voice is downloaded and loaded.
+// Synthesis requests block on this before proceeding.
+var modelReadyCh = make(chan struct{})
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const (
@@ -134,16 +138,6 @@ func main() {
 	}
 	log.Printf("Data directory: %s", dataDir)
 
-	// Download the default voice on first run so the server is immediately usable.
-	if err := ensureVoice(&voices[0]); err != nil {
-		log.Fatalf("default voice setup failed: %v", err)
-	}
-
-	// Pre-load the default voice into memory.
-	if _, err := tts.getOrSwap(&voices[0], numThreadsGlobal); err != nil {
-		log.Fatalf("failed to load default voice: %v", err)
-	}
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /v1/audio/voices", handleVoices)
@@ -151,9 +145,26 @@ func main() {
 	mux.HandleFunc("POST /v1/audio/voices/download", handleVoiceDownload)
 	mux.HandleFunc("POST /v1/audio/speech", handleSpeech)
 
+	// Start HTTP server immediately so Flutter's health-check succeeds
+	// right away (green status) rather than waiting for model load.
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)
-	log.Printf("Piper TTS server listening on http://%s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	go func() {
+		log.Printf("Piper TTS server listening on http://%s", addr)
+		log.Fatal(http.ListenAndServe(addr, mux))
+	}()
+
+	// Download + load the default voice (may take minutes on first run).
+	if err := ensureVoice(&voices[0]); err != nil {
+		log.Fatalf("default voice setup failed: %v", err)
+	}
+	if _, err := tts.getOrSwap(&voices[0], numThreadsGlobal); err != nil {
+		log.Fatalf("failed to load default voice: %v", err)
+	}
+	close(modelReadyCh)
+	log.Printf("Default voice ready — accepting synthesis requests.")
+
+	// Keep main goroutine alive (HTTP server runs in goroutine above).
+	select {}
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -164,6 +175,14 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/audio/voices — returns only downloaded voices.
 func handleVoices(w http.ResponseWriter, r *http.Request) {
+	// Return empty list while default model is still loading so the Flutter
+	// app knows to keep polling rather than showing "No voices found".
+	select {
+	case <-modelReadyCh:
+	default:
+		writeJSON(w, []voiceEntry{})
+		return
+	}
 	var available []voiceEntry
 	for i, v := range voices {
 		if fileExists(filepath.Join(modelDir(&voices[i]), v.modelFile)) {
@@ -226,6 +245,12 @@ func handleVoiceDownload(w http.ResponseWriter, r *http.Request) {
 
 // POST /v1/audio/speech — OpenAI-compatible synthesis.
 func handleSpeech(w http.ResponseWriter, r *http.Request) {
+	select {
+	case <-modelReadyCh:
+	default:
+		http.Error(w, "model not ready yet, please wait", http.StatusServiceUnavailable)
+		return
+	}
 	var req struct {
 		Input string  `json:"input"`
 		Voice string  `json:"voice"`

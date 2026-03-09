@@ -20,6 +20,9 @@ import (
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
 
+// modelReadyCh is closed once the Kokoro model is downloaded and loaded.
+var modelReadyCh = make(chan struct{})
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const (
@@ -94,6 +97,21 @@ func main() {
 	}
 	log.Printf("Data directory: %s", dataDir)
 
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", handleHealth)
+	mux.HandleFunc("GET /v1/audio/voices", handleVoices)
+	mux.HandleFunc("GET /v1/audio/voices/catalog", handleVoicesCatalog)
+	mux.HandleFunc("POST /v1/audio/speech", handleSpeech)
+
+	// Start HTTP server immediately so Flutter's health-check succeeds
+	// right away (green status) rather than waiting for model download.
+	addr := fmt.Sprintf("127.0.0.1:%d", *port)
+	go func() {
+		log.Printf("Kokoro TTS server listening on http://%s", addr)
+		log.Fatal(http.ListenAndServe(addr, mux))
+	}()
+
+	// Download + load model (may take several minutes on first run).
 	if err := ensureKokoroModel(); err != nil {
 		log.Fatalf("Kokoro model setup failed: %v", err)
 	}
@@ -122,18 +140,11 @@ func main() {
 	if ttsEngine == nil {
 		log.Fatalf("Failed to create TTS engine — check model paths")
 	}
-	defer sherpa.DeleteOfflineTts(ttsEngine)
 	log.Println("Kokoro model loaded and ready!")
+	close(modelReadyCh)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", handleHealth)
-	mux.HandleFunc("GET /v1/audio/voices", handleVoices)
-	mux.HandleFunc("GET /v1/audio/voices/catalog", handleVoicesCatalog)
-	mux.HandleFunc("POST /v1/audio/speech", handleSpeech)
-
-	addr := fmt.Sprintf("127.0.0.1:%d", *port)
-	log.Printf("Kokoro TTS server listening on http://%s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	// Keep main goroutine alive (HTTP server runs in goroutine above).
+	select {}
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -144,6 +155,12 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // GET /v1/audio/voices — returns the catalogue of Kokoro style voices.
 func handleVoices(w http.ResponseWriter, r *http.Request) {
+	select {
+	case <-modelReadyCh:
+	default:
+		writeJSON(w, []voiceEntry{})
+		return
+	}
 	writeJSON(w, kokoroVoices)
 }
 
@@ -173,6 +190,12 @@ func handleVoicesCatalog(w http.ResponseWriter, r *http.Request) {
 // Request:  {"input": "...", "voice": "af_sky", "speed": 1.0}
 // Response: audio/wav bytes
 func handleSpeech(w http.ResponseWriter, r *http.Request) {
+	select {
+	case <-modelReadyCh:
+	default:
+		http.Error(w, "model not ready yet, please wait", http.StatusServiceUnavailable)
+		return
+	}
 	var req struct {
 		Input string  `json:"input"`
 		Voice string  `json:"voice"`
