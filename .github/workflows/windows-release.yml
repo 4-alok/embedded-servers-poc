@@ -1,0 +1,37 @@
+name: Windows TTS Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          
+      - name: Install MinGW Cross-Compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+        
+      - name: Build Piper TTS (Windows amd64)
+        run: |
+          cd piper_tts
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc go build -ldflags="-s -w -extldflags '-static'" -o dist/piper_tts_server_windows_amd64.exe .
+          
+      - name: Build Kokoro TTS (Windows amd64)
+        run: |
+          cd kokoro_tts
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc go build -ldflags="-s -w -extldflags '-static'" -o dist/kokoro_tts_server_windows_amd64.exe .
+          
+      - name: Upload to Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v1.7.0 \
+            piper_tts/dist/piper_tts_server_windows_amd64.exe \
+            kokoro_tts/dist/kokoro_tts_server_windows_amd64.exe \
+            --clobber
