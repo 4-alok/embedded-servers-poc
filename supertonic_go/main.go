@@ -2,92 +2,128 @@ package main
 
 import (
 	"archive/tar"
-	"compress/bzip2"
+	"bufio"
+	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
-	"bufio"
-
-	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
 
-// modelReadyCh is closed once the Kokoro model is downloaded and loaded.
+// modelReadyCh is closed once the model assets are downloaded, extracted, and loaded.
 var modelReadyCh = make(chan struct{})
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const (
-	kokoroModelURL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2"
+	supertonicModelURL = "https://storage.googleapis.com/adsorp-public-assets/models/supertonic-3-onnx.tar.gz"
 )
-
-var dataDir string
-
-// ── Persistent TTS engine ─────────────────────────────────────────────────────
 
 var (
-	ttsEngine *sherpa.OfflineTts
-	ttsMu     sync.Mutex // guards ttsEngine during synthesis
+	dataDir      string
+	textToSpeech *TextToSpeech
+	ttsMu        sync.Mutex // guards synthesis execution to prevent concurrent ONNX calls
 )
 
-// ── Kokoro voice catalogue ────────────────────────────────────────────────────
+// ── Voice Catalog ─────────────────────────────────────────────────────────────
 
 type voiceEntry struct {
 	Name        string `json:"name"`
 	DisplayName string `json:"displayName"`
 	ID          string `json:"id"`
-	SID         int    `json:"-"` // passed as --sid to sherpa-onnx
 }
 
-// kokoroVoices list is auto-generated in voices.go
+type catalogEntry struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
+	ID          string `json:"id"`
+	Downloaded  bool   `json:"downloaded"`
+}
 
-func voiceSID(name string) int {
-	for _, v := range kokoroVoices {
-		if v.Name == name {
-			return v.SID
+var languages = []struct {
+	Code string
+	Name string
+}{
+	{"en", "English"},
+	{"ko", "Korean"},
+	{"ja", "Japanese"},
+	{"ar", "Arabic"},
+	{"bg", "Bulgarian"},
+	{"cs", "Czech"},
+	{"da", "Danish"},
+	{"de", "German"},
+	{"el", "Greek"},
+	{"es", "Spanish"},
+	{"et", "Estonian"},
+	{"fi", "Finnish"},
+	{"fr", "French"},
+	{"hi", "Hindi"},
+	{"hr", "Croatian"},
+	{"hu", "Hungarian"},
+	{"id", "Indonesian"},
+	{"it", "Italian"},
+	{"lt", "Lithuanian"},
+	{"lv", "Latvian"},
+	{"nl", "Dutch"},
+	{"pl", "Polish"},
+	{"pt", "Portuguese"},
+	{"ro", "Romanian"},
+	{"ru", "Russian"},
+	{"sk", "Slovak"},
+	{"sl", "Slovenian"},
+	{"sv", "Swedish"},
+	{"tr", "Turkish"},
+	{"uk", "Ukrainian"},
+	{"vi", "Vietnamese"},
+	{"na", "Language-Agnostic"},
+}
+
+var styles = []struct {
+	Code string
+	Name string
+}{
+	{"F1", "Female 1"},
+	{"F2", "Female 2"},
+	{"F3", "Female 3"},
+	{"F4", "Female 4"},
+	{"F5", "Female 5"},
+	{"M1", "Male 1"},
+	{"M2", "Male 2"},
+	{"M3", "Male 3"},
+	{"M4", "Male 4"},
+	{"M5", "Male 5"},
+}
+
+var supertonicVoices []voiceEntry
+var cachedStyles = make(map[string]*Style)
+
+func initVoices() {
+	supertonicVoices = make([]voiceEntry, 0, len(languages)*len(styles))
+	for _, lang := range languages {
+		for _, style := range styles {
+			id := lang.Code + "_" + style.Code
+			displayName := fmt.Sprintf("%s (%s) — Supertonic", lang.Name, style.Name)
+			supertonicVoices = append(supertonicVoices, voiceEntry{
+				Name:        id,
+				DisplayName: displayName,
+				ID:          id,
+			})
 		}
 	}
-	return 0 // default to af
-}
-
-func voiceLang(name string) string {
-	if len(name) < 1 {
-		return "en"
-	}
-	switch name[0] {
-	case 'a', 'b':
-		return "en"
-	case 'j':
-		return "ja"
-	case 'z':
-		return "zh"
-	case 'e':
-		return "es"
-	case 'f':
-		return "fr"
-	case 'h':
-		return "hi"
-	case 'i':
-		return "it"
-	case 'p':
-		return "pt-br"
-	}
-	return "en"
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 func main() {
-	port := flag.Int("port", 8082, "Port to listen on")
+	port := flag.Int("port", 8083, "Port to listen on")
 	numThreads := flag.Int("threads", runtime.NumCPU(), "Number of threads for ONNX inference")
 	ipc := flag.Bool("ipc", false, "Use stdin/stdout for IPC instead of HTTP")
 	flag.Parse()
@@ -96,6 +132,8 @@ func main() {
 		// Redirect all logs to Stderr to keep Stdout clean for the IPC protocol.
 		log.SetOutput(os.Stderr)
 	}
+
+	initVoices()
 
 	var err error
 	dataDir, err = resolveDataDir()
@@ -114,41 +152,48 @@ func main() {
 	// right away (green status) rather than waiting for model download.
 	addr := fmt.Sprintf("127.0.0.1:%d", *port)
 	go func() {
-		log.Printf("Kokoro TTS server listening on http://%s", addr)
+		log.Printf("Supertonic TTS server listening on http://%s", addr)
 		log.Fatal(http.ListenAndServe(addr, mux))
 	}()
 
 	// Download + load model (may take several minutes on first run).
-	if err := ensureKokoroModel(); err != nil {
-		log.Fatalf("Kokoro model setup failed: %v", err)
+	if err := ensureSupertonicModel(); err != nil {
+		log.Fatalf("Supertonic model setup failed: %v", err)
 	}
 
-	// ── Load TTS model once into memory ──────────────────────────────────
-	modelDir := filepath.Join(dataDir, "kokoro-multi-lang-v1_0")
-
-	lexicons := filepath.Join(modelDir, "lexicon-us-en.txt") + "," +
-		filepath.Join(modelDir, "lexicon-gb-en.txt") + "," +
-		filepath.Join(modelDir, "lexicon-zh.txt")
-
-	config := sherpa.OfflineTtsConfig{}
-	config.Model.Kokoro.Model = filepath.Join(modelDir, "model.onnx")
-	config.Model.Kokoro.Voices = filepath.Join(modelDir, "voices.bin")
-	config.Model.Kokoro.Tokens = filepath.Join(modelDir, "tokens.txt")
-	config.Model.Kokoro.DataDir = filepath.Join(modelDir, "espeak-ng-data")
-	config.Model.Kokoro.Lexicon = lexicons
-	config.Model.Kokoro.LengthScale = 1.0
-	config.Model.NumThreads = *numThreads
-	config.Model.Debug = 0
-	config.Model.Provider = "cpu"
-	config.MaxNumSentences = 1
-
+	// ── Initialize ONNX Runtime & Load Models ────────────────────────────
 	log.Printf("STAGE: LOAD")
-	log.Printf("Loading Kokoro model (threads=%d)...", *numThreads)
-	ttsEngine = sherpa.NewOfflineTts(&config)
-	if ttsEngine == nil {
-		log.Fatalf("Failed to create TTS engine — check model paths")
+	log.Printf("Initializing ONNX Runtime...")
+	if err := InitializeONNXRuntime(); err != nil {
+		log.Fatalf("ONNX Runtime initialization failed: %v", err)
 	}
-	log.Println("Kokoro model loaded and ready!")
+
+	onnxDir := filepath.Join(dataDir, "onnx")
+	log.Printf("Loading configuration from %s...", onnxDir)
+	cfg, err := LoadCfgs(onnxDir)
+	if err != nil {
+		log.Fatalf("Failed to load configs: %v", err)
+	}
+
+	log.Printf("Loading model sessions (threads=%d)...", *numThreads)
+	// We pass CPU provider for our local inference
+	textToSpeech, err = LoadTextToSpeech(onnxDir, false, cfg)
+	if err != nil {
+		log.Fatalf("Failed to load TextToSpeech engine: %v", err)
+	}
+
+	log.Printf("Pre-loading all 10 voice styles...")
+	for _, style := range styles {
+		stylePath := filepath.Join(dataDir, "voice_styles", style.Code+".json")
+		log.Printf("  Loading %s.json...", style.Code)
+		st, err := LoadVoiceStyle([]string{stylePath}, false)
+		if err != nil {
+			log.Fatalf("Failed to load style %s: %v", style.Code, err)
+		}
+		cachedStyles[style.Code] = st
+	}
+
+	log.Println("Supertonic model loaded and ready!")
 	close(modelReadyCh)
 
 	if *ipc {
@@ -176,7 +221,6 @@ type ipcResponse struct {
 func handleIPC() {
 	log.Println("IPC mode enabled. Listening on Stdin...")
 
-	// Use a buffered reader for efficiency, but we read fixed headers.
 	reader := bufio.NewReader(os.Stdin)
 	header := make([]byte, 8)
 
@@ -221,25 +265,25 @@ func handleIPCRequest(req ipcRequest) {
 	log.Printf("IPC: Handling request method: '%s' (ID: %d)", req.Method, req.ID)
 	switch req.Method {
 	case "health":
-		sendIPCResponse(req.ID, map[string]string{"status": "ok", "engine": "kokoro"}, nil)
+		sendIPCResponse(req.ID, map[string]string{"status": "ok", "engine": "supertonic"}, nil)
 
 	case "voices":
 		select {
 		case <-modelReadyCh:
-			sendIPCResponse(req.ID, kokoroVoices, nil)
+			sendIPCResponse(req.ID, supertonicVoices, nil)
 		default:
 			sendIPCResponse(req.ID, []voiceEntry{}, nil)
 		}
 
 	case "catalog":
 		log.Println("IPC: Handling catalog request")
-		catalog := make([]catalogEntry, len(kokoroVoices))
-		for i, v := range kokoroVoices {
+		catalog := make([]catalogEntry, len(supertonicVoices))
+		for i, v := range supertonicVoices {
 			catalog[i] = catalogEntry{
 				Name:        v.Name,
 				DisplayName: v.DisplayName,
 				ID:          v.ID,
-				Downloaded:  true,
+				Downloaded:  true, // Models are unified in a single tar.gz download
 			}
 		}
 		sendIPCResponse(req.ID, catalog, nil)
@@ -257,7 +301,7 @@ func handleIPCRequest(req ipcRequest) {
 				return
 			}
 			if params.Speed == 0 {
-				params.Speed = 1.0
+				params.Speed = 1.05
 			}
 
 			wavBytes, err := synthesize(params.Input, params.Voice, params.Speed)
@@ -316,13 +360,13 @@ func sendIPCResponse(id int, result any, binaryPart []byte) {
 	}
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
+// ── HTTP Handlers ─────────────────────────────────────────────────────────────
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]string{"status": "ok", "engine": "kokoro"})
+	writeJSON(w, map[string]string{"status": "ok", "engine": "supertonic"})
 }
 
-// GET /v1/audio/voices — returns the catalogue of Kokoro style voices.
+// GET /v1/audio/voices — returns the catalogue of Supertonic voices.
 func handleVoices(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-modelReadyCh:
@@ -330,21 +374,13 @@ func handleVoices(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, []voiceEntry{})
 		return
 	}
-	writeJSON(w, kokoroVoices)
+	writeJSON(w, supertonicVoices)
 }
 
-type catalogEntry struct {
-	Name        string `json:"name"`
-	DisplayName string `json:"displayName"`
-	ID          string `json:"id"`
-	Downloaded  bool   `json:"downloaded"`
-}
-
-// GET /v1/audio/voices/catalog — all Kokoro voices ship with the single model,
-// so every voice is always downloaded once the server starts.
+// GET /v1/audio/voices/catalog — returns all known voices with download status.
 func handleVoicesCatalog(w http.ResponseWriter, r *http.Request) {
-	catalog := make([]catalogEntry, len(kokoroVoices))
-	for i, v := range kokoroVoices {
+	catalog := make([]catalogEntry, len(supertonicVoices))
+	for i, v := range supertonicVoices {
 		catalog[i] = catalogEntry{
 			Name:        v.Name,
 			DisplayName: v.DisplayName,
@@ -355,9 +391,7 @@ func handleVoicesCatalog(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, catalog)
 }
 
-// POST /v1/audio/speech — OpenAI-compatible synthesis endpoint.
-// Request:  {"input": "...", "voice": "af_sky", "speed": 1.0}
-// Response: audio/wav bytes
+// POST /v1/audio/speech — OpenAI-compatible synthesis.
 func handleSpeech(w http.ResponseWriter, r *http.Request) {
 	select {
 	case <-modelReadyCh:
@@ -365,12 +399,13 @@ func handleSpeech(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "model not ready yet, please wait", http.StatusServiceUnavailable)
 		return
 	}
+
 	var req struct {
 		Input string  `json:"input"`
 		Voice string  `json:"voice"`
 		Speed float64 `json:"speed"`
 	}
-	req.Speed = 1.0
+	req.Speed = 1.05
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
@@ -391,26 +426,47 @@ func handleSpeech(w http.ResponseWriter, r *http.Request) {
 	w.Write(wavBytes)
 }
 
-// ── Synthesis (in-process) ───────────────────────────────────────────────────
+// ── Synthesis Pipeline ────────────────────────────────────────────────────────
 
-func synthesize(text, voiceName string, speed float64) ([]byte, error) {
-	sid := voiceSID(voiceName)
-	speedF32 := float32(math.Max(speed, 1e-6))
-
-	lang := voiceLang(voiceName)
-	// Prefix text with language tag for multi-lingual Kokoro.
-	// This ensures the correct phonemizer rules are applied.
-	taggedText := fmt.Sprintf("[%s]%s", lang, text)
-
-	ttsMu.Lock()
-	audio := ttsEngine.Generate(taggedText, sid, speedF32)
-	ttsMu.Unlock()
-
-	if audio == nil || len(audio.Samples) == 0 {
-		return nil, fmt.Errorf("synthesis returned empty audio")
+func synthesize(text string, voiceName string, speed float64) ([]byte, error) {
+	// Parse composite voice ID (e.g. "ko_F1" -> lang="ko", styleCode="F1")
+	lang := "en"
+	styleCode := "M1"
+	parts := strings.Split(voiceName, "_")
+	if len(parts) == 2 {
+		lang = parts[0]
+		styleCode = parts[1]
+	} else if len(parts) == 1 && parts[0] != "" {
+		// Fallback for simple voice name or legacy setting
+		styleCode = parts[0]
 	}
 
-	return samplesToWAV(audio.Samples, audio.SampleRate), nil
+	// Validate styleCode matches cached style
+	style, found := cachedStyles[styleCode]
+	if !found {
+		log.Printf("Warning: requested voice style %q not found, defaulting to M1", styleCode)
+		style = cachedStyles["M1"]
+	}
+
+	speedF32 := float32(speed)
+	if speedF32 <= 0 {
+		speedF32 = 1.05
+	}
+
+	// Guard synthesis execution to avoid concurrent ONNX runtime crashes
+	ttsMu.Lock()
+	samples, _, err := textToSpeech.Call(text, lang, style, 8, speedF32, 0.3)
+	ttsMu.Unlock()
+
+	if err != nil {
+		return nil, fmt.Errorf("synthesis failed: %w", err)
+	}
+
+	if len(samples) == 0 {
+		return nil, fmt.Errorf("synthesis returned empty samples")
+	}
+
+	return samplesToWAV(samples, textToSpeech.SampleRate), nil
 }
 
 // samplesToWAV encodes float32 PCM samples into a WAV file (16-bit PCM) in memory.
@@ -456,24 +512,24 @@ func samplesToWAV(samples []float32, sampleRate int) []byte {
 
 // ── Download helpers ──────────────────────────────────────────────────────────
 
-func ensureKokoroModel() error {
-	modelDir := filepath.Join(dataDir, "kokoro-multi-lang-v1_0")
-	// Check for a file that is usually extracted late to ensure extraction completed.
-	if fileExists(filepath.Join(modelDir, "espeak-ng-data", "phontab")) {
-		log.Printf("Kokoro model already present.")
+func ensureSupertonicModel() error {
+	onnxDir := filepath.Join(dataDir, "onnx")
+	// Check for a file that is extracted late to ensure extraction completed.
+	if fileExists(filepath.Join(onnxDir, "vocoder.onnx")) && fileExists(filepath.Join(dataDir, "voice_styles", "M1.json")) {
+		log.Printf("Supertonic model already present.")
 		return nil
 	}
 
-	archivePath := filepath.Join(dataDir, "kokoro-multi-lang-v1_0.tar.bz2")
-	log.Printf("Downloading Kokoro model from %s ...", kokoroModelURL)
-	if err := downloadFile(kokoroModelURL, archivePath); err != nil {
-		return fmt.Errorf("download kokoro model: %w", err)
+	archivePath := filepath.Join(dataDir, "supertonic-3-onnx.tar.gz")
+	log.Printf("Downloading Supertonic model from %s ...", supertonicModelURL)
+	if err := downloadFile(supertonicModelURL, archivePath); err != nil {
+		return fmt.Errorf("download supertonic model: %w", err)
 	}
 	defer os.Remove(archivePath)
 
 	log.Printf("STAGE: EXTRACT")
-	log.Printf("Extracting Kokoro model...")
-	return extractTarBz2(archivePath, dataDir)
+	log.Printf("Extracting Supertonic model...")
+	return extractTarGz(archivePath, dataDir)
 }
 
 // ── Archive helpers ───────────────────────────────────────────────────────────
@@ -502,14 +558,20 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func extractTarBz2(archivePath, destDir string) error {
+func extractTarGz(archivePath, destDir string) error {
 	f, err := os.Open(archivePath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	tr := tar.NewReader(bzip2.NewReader(f))
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gr.Close()
+
+	tr := tar.NewReader(gr)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -530,8 +592,8 @@ func extractTarBz2(archivePath, destDir string) error {
 			}
 			log.Printf("Unpacking: %s (size: %d MB)", hdr.Name, hdr.Size/(1024*1024))
 			pw := &progressWriter{
-				Writer: out,
-				fileName: hdr.Name,
+				Writer:    out,
+				fileName:  hdr.Name,
 				totalSize: hdr.Size,
 			}
 			_, err = io.Copy(pw, tr)
@@ -549,7 +611,7 @@ func downloadFile(url, dst string) error {
 		return err
 	}
 	log.Printf("STAGE: DOWNLOAD")
-	log.Printf("Downloading Kokoro model from %s ...", url)
+	log.Printf("Downloading Supertonic model from %s ...", url)
 	resp, err := http.Get(url)
 	if err != nil {
 		return err
@@ -603,11 +665,11 @@ func resolveDataDir() (string, error) {
 	var base string
 	switch runtime.GOOS {
 	case "darwin":
-		base = filepath.Join(home, "Library", "Application Support", "kokoro_tts")
+		base = filepath.Join(home, "Library", "Application Support", "supertonic_tts")
 	case "windows":
-		base = filepath.Join(os.Getenv("APPDATA"), "kokoro_tts")
+		base = filepath.Join(os.Getenv("APPDATA"), "supertonic_tts")
 	default:
-		base = filepath.Join(home, ".local", "share", "kokoro_tts")
+		base = filepath.Join(home, ".local", "share", "supertonic_tts")
 	}
 	return base, os.MkdirAll(base, 0755)
 }

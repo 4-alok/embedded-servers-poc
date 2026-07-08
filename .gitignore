@@ -2,3 +2,32 @@
 *.exe
 *.dylib
 *.so
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+**/*.log
+
+# Build distributions and temporary files
+**/dist/
+**/tmp_*/
+tmp_*
+**/scratch/
+
+# Built binaries (Go and others)
+*_*_darwin_*
+*_*_linux_*
+*_*_windows_*
+**/kokoro_tts_server*
+**/piper_tts_server*
+**/supertonic-tts*
+**/supertonic_tts_server*
+kokoro_tts/kokoro_tts_server
+piper_tts/piper_tts_server
+
+# Prototype/local directories not meant to be in repo
+OmniVoice/
+clean_tts_server/
