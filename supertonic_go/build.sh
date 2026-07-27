@@ -18,12 +18,21 @@ package_macos() {
   mkdir -p "${tmp_dir}"
   mv "dist/${bin_name}" "${tmp_dir}/"
 
-  # If this is arm64 (the primary target of the host system), copy the pre-existing libonnxruntime.dylib
-  # next to the executable to ensure zero-dependency, plug-and-play functionality out-of-the-box.
-  local kokoro_lib="/Users/alok/Projects/adsorp/embedded-servers-poc/kokoro_tts/dist/libonnxruntime.dylib"
-  if [ "${arch}" = "arm64" ] && [ -f "${kokoro_lib}" ]; then
+  # Ship libonnxruntime.dylib next to the executable so the server is
+  # zero-dependency out-of-the-box. A tarball without the dylib crashes on
+  # machines that don't have onnxruntime installed system-wide, so the arm64
+  # build hard-fails if the dylib is missing.
+  local onnx_lib="$(cd "$(dirname "$0")" && pwd)/libs/libonnxruntime.dylib"
+  if [ "${arch}" = "arm64" ]; then
+    if [ ! -f "${onnx_lib}" ]; then
+      echo "ERROR: ${onnx_lib} not found — refusing to package a dylib-less arm64 tarball." >&2
+      exit 1
+    fi
     echo "    Packaging Apple Silicon libonnxruntime.dylib alongside the executable..."
-    cp "${kokoro_lib}" "${tmp_dir}/"
+    cp "${onnx_lib}" "${tmp_dir}/"
+  else
+    echo "    WARNING: ${arch} tarball ships WITHOUT libonnxruntime.dylib (no x86_64 dylib available);" >&2
+    echo "             users must install onnxruntime or set ONNXRUNTIME_LIB_PATH." >&2
   fi
 
   # Package into tar.gz

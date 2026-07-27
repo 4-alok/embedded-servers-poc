@@ -150,11 +150,16 @@ func main() {
 
 	// Start HTTP server immediately so Flutter's health-check succeeds
 	// right away (green status) rather than waiting for model download.
-	addr := fmt.Sprintf("127.0.0.1:%d", *port)
-	go func() {
-		log.Printf("Supertonic TTS server listening on http://%s", addr)
-		log.Fatal(http.ListenAndServe(addr, mux))
-	}()
+	// In IPC mode all traffic (including health) goes over stdin/stdout, so
+	// skip the listener entirely — a fixed port here would collide with other
+	// IPC engines (e.g. Kokoro) and log.Fatal the process.
+	if !*ipc {
+		addr := fmt.Sprintf("127.0.0.1:%d", *port)
+		go func() {
+			log.Printf("Supertonic TTS server listening on http://%s", addr)
+			log.Fatal(http.ListenAndServe(addr, mux))
+		}()
+	}
 
 	// Download + load model (may take several minutes on first run).
 	if err := ensureSupertonicModel(); err != nil {
